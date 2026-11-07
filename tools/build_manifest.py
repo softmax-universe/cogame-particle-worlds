@@ -25,7 +25,7 @@ OUT = ROOT / "coworld_manifest_template.json"
 
 SLUG = "particle-worlds"
 IMAGE_PLACEHOLDER = "{{PARTICLE_WORLDS_IMAGE}}"
-SOURCE_URL = "https://github.com/Metta-AI/cogame-particle-worlds/tree/main"
+SOURCE_URL = "https://github.com/softmax-universe/cogame-particle-worlds/tree/main"
 SEATS = 4
 
 # Every physics/scoring constant, at the default the sim ships. Shared by every variant so a
