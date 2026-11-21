@@ -317,6 +317,22 @@ proc scriptedFor(
 ): SquadDirective =
   scriptedDirective(engine.ctl, sim, kind, sim.commandedCogs(seat))
 
+proc holdFallbackDirective*(sim: SimServer, cogs: seq[int]): SquadDirective =
+  ## Neutral hold directive for scored LLM failures (never runs `drifter`).
+  result = SquadDirective(source: dsFallback)
+  for cogIndex in cogs:
+    let px = sim.players[cogIndex].x + CollisionW div 2
+    let py = sim.players[cogIndex].y + CollisionH div 2
+    result.orders.add(CogOrder(
+      cogIndex: cogIndex,
+      id: sim.cogAlias(cogIndex),
+      intent: intHold,
+      targetX: px,
+      targetY: py,
+      symbol: 0,
+      fromReply: false
+    ))
+
 proc drifterFor*(
   engine: DecisionEngine, sim: SimServer, cogs: seq[int]
 ): SquadDirective =
@@ -424,14 +440,12 @@ proc turn*(
       # happened. A seat that registered as SCRIPTED is not a fallback and
       # gets no record (which is why certification's two baseline seats write
       # none).
-      var directive = engine.drifterFor(sim, sim.commandedCogs(seat))
-      directive.source = dsFallback
-      engine.directives[seat] = directive
+      engine.directives[seat] = holdFallbackDirective(sim, sim.commandedCogs(seat))
       engine.haveDirective[seat] = true
       let cause = if engine.llmOff: "budget_guard" else: "no_credentials"
       result.add(fallbackRecord(roundIndex, turnIndex, seat, 1, cause,
-        "the LLM is unavailable for this turn; playing drifter"))
-      echo "particle-worlds llm: seat ", seat, " falling back to drifter (", cause,
+        "the LLM is unavailable for this turn; holding position"))
+      echo "particle-worlds llm: seat ", seat, " falling back to neutral hold (", cause,
         ") on turn ", turnIndex
     else:
       var directive = engine.scriptedFor(
@@ -575,11 +589,9 @@ proc turn*(
         open.len, " seat(s) fall back for turn ", turnIndex
       break
 
-  # --- anything still open plays drifter for this turn ---------------------
+  # --- anything still open holds position (never plays scripted drifter) ---
   for seat in open:
-    var directive = engine.drifterFor(sim, sim.commandedCogs(seat))
-    directive.source = dsFallback
-    engine.directives[seat] = directive
+    engine.directives[seat] = holdFallbackDirective(sim, sim.commandedCogs(seat))
     engine.haveDirective[seat] = true
     let cause =
       if engine.client.disabled or engine.client.transport == ltNone:
@@ -590,14 +602,14 @@ proc turn*(
       else: "parse_error"
     let detail =
       if lastDetail[seat].len > 0: lastDetail[seat]
-      else: "seat fell back to the drifter directive"
+      else: "seat fell back to neutral hold"
     ## The one authoritative record for this seat-turn: `attempt` is how many
     ## attempts it spent (1 when the retry never went out -- a throttle, a
     ## disabled client or an exhausted budget -- 2 when it did).
     result.add(fallbackRecord(roundIndex, turnIndex, seat,
       max(1, attemptsSpent[seat]), cause, detail))
     ## "falling back" is the phrase phase 60 greps the GAME log for.
-    echo "particle-worlds llm: seat ", seat, " falling back to drifter (", cause,
+    echo "particle-worlds llm: seat ", seat, " falling back to neutral hold (", cause,
       ") on turn ", turnIndex
 
   for seat in 0 ..< engine.seats.len:
