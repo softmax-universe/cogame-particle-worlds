@@ -434,6 +434,10 @@ proc turn*(
           cause = "throttled"
         elif error.msg.startsWith("llm auth failed"):
           cause = "auth_error"
+        elif error.msg.startsWith("anthropic error") or
+             error.msg.startsWith("anthropic refusal") or
+             error.msg.startsWith("bedrock model access denied"):
+          cause = "provider_error"
         lastCause[seat] = cause
         lastDetail[seat] = error.msg
         echo "particle-worlds llm: seat ", seat, " attempt ", attempt + 1,

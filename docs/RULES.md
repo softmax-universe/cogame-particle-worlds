@@ -205,9 +205,8 @@ nothing in particle worlds can be destroyed.
 Both emit the same order object an LLM does, on the same cadence, so the two policy kinds are
 strictly comparable. Both are pure functions of the world state plus the seat's own entitlements.
 
-**`drifter`** — the certification player, the per-turn LLM fallback, the driver of a no-show or
-disconnected seat, and the default for a seat that sets neither `PLAYER_PROMPT` nor
-`PLAYER_SCRIPTED`:
+**`drifter`** — the explicit scripted baseline opponent (`PLAYER_SCRIPTED=drifter`) and the
+default for a non-LLM seat that sets neither `PLAYER_PROMPT` nor `COWORLD_LLM_ENABLED=true`:
 
 * `spread` — `cover` the mark whose index equals your role index, and say the letter at that index
   (`A`..`D`). Four `drifter` seats therefore cover four distinct marks: the correct cooperative

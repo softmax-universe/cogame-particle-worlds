@@ -106,12 +106,14 @@ the next round's mode, mark layout, colour permutation, goal and key.
 ### Reply
 
 See `docs/RULES.md` §Orders for the schema and the per-field caps. Parsing is strict: the reply
-must be a single JSON object starting with `{` and ending with `}`, with `cogs` as a 1-element
+must be a single JSON object starting with `{` and ending with `}` (optionally wrapped in a single
+outer ```` ``` ```` or ```` ```json ```` fence with no surrounding prose), with `cogs` as a 1-element
 array naming the seat's own alias, a legal `intent`, a 2-element numeric `target` array (clamped to
 the field), an optional `null` or `[x, y]` `face`, and a legal `symbol` (`-` or `A..H`). Invalid
 replies trigger a single retry; if an LLM seat still fails (invalid output, timeout, throttle,
-unavailable endpoint, or auth error), the game declares a terminal player failure via
-`COGAME_PLAYER_FAILURE_URI` and exits without executing a substitute move or publishing scores.
+unavailable endpoint, provider error, or auth error), the game persists any partial replay,
+declares a terminal player failure via `COGAME_PLAYER_FAILURE_URI`, and exits without executing a
+substitute move or publishing scores.
 
 Every recorded string is truncated on **rune** (Unicode codepoint) boundaries, never bytes:
 `note` ≤ 160 runes, `register.policy` ≤ 48, the whole serialized
