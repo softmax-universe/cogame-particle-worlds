@@ -17,7 +17,7 @@ proc parse(text: string): SquadDirective =
 
 suite "directive parsing":
 
-  test "strict JSON object is accepted and prose/fenced replies are rejected":
+  test "strict JSON object or single outer answer fence is accepted; prose and multiple fences are rejected":
     let directive = parse(
       """{"note":"go","cogs":[{"id":"BLUE-alpha","intent":"cover","target":[10,20],"face":null,"symbol":"F"}]}""")
     check directive.orders.len == 1
@@ -27,11 +27,31 @@ suite "directive parsing":
     check not directive.orders[0].hasFace
     check directive.orders[0].symbol == symbolIndexOfText("F")
 
+    let fencedJson = parse("""```json
+{"note":"go","cogs":[{"id":"BLUE-alpha","intent":"cover","target":[10,20],"face":null,"symbol":"F"}]}
+```""")
+    check fencedJson.orders.len == 1
+    check fencedJson.orders[0].intent == intCover
+    check fencedJson.orders[0].symbol == symbolIndexOfText("F")
+
+    let fencedPlain = parse("""```
+{"note":"go","cogs":[{"id":"BLUE-alpha","intent":"hold","target":[10,20],"symbol":"-"}]}
+```""")
+    check fencedPlain.orders.len == 1
+    check fencedPlain.orders[0].intent == intHold
+
     for bad in [
         """Sure! Here is my order:
 {"note":"go","cogs":[{"id":"BLUE-alpha","intent":"cover","target":[10,20],"symbol":"F"}]}""",
-        """```json
+        """Here is my order:
+```json
 {"note":"go","cogs":[{"id":"BLUE-alpha","intent":"cover","target":[10,20],"symbol":"F"}]}
+```""",
+        """```json
+{"note":"a","cogs":[{"id":"BLUE-alpha","intent":"cover","target":[10,20],"symbol":"F"}]}
+```
+```json
+{"note":"b","cogs":[{"id":"BLUE-alpha","intent":"hold","target":[10,20],"symbol":"-"}]}
 ```""",
         """I refuse to answer in JSON."""]:
       expect DirectiveError:

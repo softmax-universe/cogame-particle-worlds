@@ -200,6 +200,18 @@ suite "the turn loop":
     for seat in 0 ..< 4:
       check not engine.haveDirective[seat]
 
+  test "a provider error (400 invalid model) ends in terminal policyFailure with provider_error":
+    var sim = seatedSim(fixtureConfig(@[modeSpread]))
+    var engine = llmEngine(sim)
+    statusCode.store(400)
+    resetWindows()
+    discard engine.turn(sim, 2, 10, 0)
+    statusCode.store(200)
+    check engine.policyFailure.failed
+    check engine.policyFailure.cause == "provider_error"
+    for seat in 0 ..< 4:
+      check not engine.haveDirective[seat]
+
   test "a throttle (429) skips the retry and ends in terminal policyFailure":
     var sim = seatedSim(fixtureConfig(@[modeSpread]))
     var engine = llmEngine(sim)

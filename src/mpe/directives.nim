@@ -110,18 +110,36 @@ proc parseIntent*(text: string): Intent =
       return intent
   raise newException(DirectiveError, "invalid intent: " & text.truncateRunes(32))
 
+proc stripSingleCodeFence(trimmed: string): tuple[ok: bool, body: string] =
+  ## Unwraps a single outer markdown code fence (``` or ```json) ONLY when the
+  ## entire reply is that one fence with no surrounding prose or inner fences.
+  if not trimmed.startsWith("```") or not trimmed.endsWith("```") or trimmed.len < 6:
+    return (false, trimmed)
+  let nl = trimmed.find('\n')
+  if nl < 0 or nl >= trimmed.len - 3:
+    return (false, trimmed)
+  let tag = trimmed[3 ..< nl].strip().toLowerAscii()
+  if tag.len > 0 and tag != "json":
+    return (false, trimmed)
+  let inner = trimmed[nl + 1 ..< trimmed.len - 3].strip()
+  if "```" in inner:
+    return (false, trimmed)
+  (true, inner)
+
 proc extractJsonObject*(text: string): JsonNode =
-  ## Strict JSON object parser: the reply must be a single JSON object with no
-  ## surrounding prose or markdown fences.
+  ## Strict JSON object parser: the reply must be a single JSON object
+  ## (optionally wrapped in a single outer ``` or ```json fence) with no
+  ## surrounding prose and no brace scraping.
   let trimmed = text.strip()
-  if trimmed.len < 2 or trimmed[0] != '{' or trimmed[^1] != '}':
+  let (_, candidate) = stripSingleCodeFence(trimmed)
+  if candidate.len < 2 or candidate[0] != '{' or candidate[^1] != '}':
     var head = trimmed
     if head.runeLen > 160:
       head = head.truncateRunes(160) & "..."
     raise newException(
       DirectiveError, "reply must be a single JSON object: " & head.replace("\n", " "))
   try:
-    result = parseJson(trimmed)
+    result = parseJson(candidate)
   except CatchableError as e:
     raise newException(DirectiveError, "invalid JSON in reply: " & e.msg)
   if result.kind != JObject:

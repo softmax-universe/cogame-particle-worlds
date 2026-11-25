@@ -1203,14 +1203,33 @@ proc declarePlayerFailure(slot: int, message: string) =
   ## poisoning the whole episode unattributed. Best-effort: the abort that
   ## follows must never be masked by a declaration write failure, and outside
   ## the platform (env unset) this is a no-op.
+  let clean =
+    if message.strip().len > 0: message.strip().truncateRunes(1900)
+    else: "player policy failure"
   try:
     writeCogameEnv(
       "COGAME_PLAYER_FAILURE_URI",
-      $(%*{"failed_policy_index": slot, "message": message}),
+      $(%*{"failed_policy_index": max(0, slot), "message": clean}),
       "application/json"
     )
   except CatchableError as e:
     echo "player-failure declaration failed: ", e.msg
+
+proc flushPartialReplay(
+  replayWriter: var ReplayWriter,
+  saveReplayPath: string,
+  runtimeConfig: RuntimeConfig
+) =
+  ## Closes and persists any partial replay captured before a terminal failure,
+  ## best-effort so a write error never masks the failure declaration.
+  try:
+    replayWriter.closeReplayWriter()
+    if saveReplayPath.len > 0 and fileExists(saveReplayPath):
+      echo "Partial replay written: ", saveReplayPath,
+        " (", getFileSize(saveReplayPath), " bytes)"
+      runtimeConfig.writeReplay(readFile(saveReplayPath))
+  except CatchableError as e:
+    echo "partial replay write failed: ", e.msg
 
 proc parseRegistration(
   text: string
@@ -1964,9 +1983,9 @@ proc runServerLoop*(
           let msg = "model policy failure on seat " & $failure.seat & " (" &
             failure.cause & "): " & failure.detail
           echo "particle-worlds: ", msg
+          flushPartialReplay(replayWriter, saveReplayPath, runtimeConfig)
           declarePlayerFailure(failure.seat, msg)
           engine.capture.finishFailed(failure.seat, failure.cause, failure.detail)
-          replayWriter.closeReplayWriter()
           httpServer.close()
           joinThread(serverThread)
           quit(1)
@@ -2022,9 +2041,9 @@ proc runServerLoop*(
             let msg = "model policy failure on seat " & $seat &
               " (missing_directive): no valid directive available"
             echo "particle-worlds: ", msg
+            flushPartialReplay(replayWriter, saveReplayPath, runtimeConfig)
             declarePlayerFailure(seat, msg)
             engine.capture.finishFailed(seat, "missing_directive", msg)
-            replayWriter.closeReplayWriter()
             httpServer.close()
             joinThread(serverThread)
             quit(1)
