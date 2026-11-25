@@ -65,6 +65,12 @@ proc modelAttempt*(identity, policy, model, url, body: string,
 proc recordAttempt*(capture: RuntimeCapture, seat: int, evidence: DecisionAttempt) =
   if capture != nil: capture.turn[seat].attempts.add(evidence)
 
+proc failedDecision*(capture: RuntimeCapture, seat, tick: int) =
+  if capture == nil: return
+  capture.trajectory.recordDecision($tick & "-" & $seat, $seat,
+    capture.turn[seat].observation, capture.turn[seat].attempts,
+    none(string), newJNull(), asRejected)
+
 proc applied*(capture: RuntimeCapture, seat, tick: int, action: JsonNode,
     origin: AttemptOrigin, policy: string) =
   if capture == nil: return
@@ -72,18 +78,22 @@ proc applied*(capture: RuntimeCapture, seat, tick: int, action: JsonNode,
   var selected = none(string)
   for attempt in attempts:
     if attempt.accepted: selected = some(attempt.attemptId)
-  let fallback = origin == aoFallback or (origin == aoModel and selected.isNone)
-  if origin != aoModel or fallback:
-    var actual = newDecisionAttempt($tick & "-" & $seat & "-engine", policy,
-      if fallback: aoFallback else: origin)
+  if origin != aoModel:
+    var actual = newDecisionAttempt($tick & "-" & $seat & "-engine", policy, origin)
     actual.parsedAction = copy(action)
     actual.accepted = true
     selected = some(actual.attemptId)
     attempts.add(actual)
   capture.trajectory.recordDecision($tick & "-" & $seat, $seat,
-    capture.turn[seat].observation, attempts, selected, action,
-    if fallback: asFallback else: asAccepted,
-    fallbackOrigin = (if fallback: some(policy) else: none(string)))
+    capture.turn[seat].observation, attempts, selected, action, asAccepted)
+
+proc finishFailed*(capture: RuntimeCapture, seat: int, cause, detail: string) =
+  if capture == nil: return
+  capture.trajectory.finish(esFailed,
+    %*{"reason": "policy_failure", "failed_policy_index": seat,
+       "cause": cause, "detail": detail},
+    newJNull())
+  capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
 
 proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
   if capture == nil: return

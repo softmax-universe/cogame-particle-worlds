@@ -39,7 +39,8 @@ whose slot is not the next open one is not admitted until the lower slots have j
 holds an unappliable registration and re-reads it when the slot lands.
 
 ```json
-{"type":"register","prompt":"<strategy text or empty>",
+{"type":"register","llm":true|false,"model":"<model id or empty>",
+ "prompt":"<strategy text or empty>",
  "scripted":"drifter"|"beeline"|null,"policy":"<free label>"}
 ```
 
@@ -47,7 +48,9 @@ The prompt is a **secret**: it is consumed as registration, never applied as a b
 written to the replay. What the replay gets is a redacted `register` record — the policy label and
 kind only. Any other chat text from a seat is dropped: particles emit symbols, seats do not chat.
 
-A seat that never registers, or registers with neither field, is `scripted: "drifter"`.
+An explicit `scripted` choice (`"drifter"` or `"beeline"`) selects that scripted baseline. Setting
+`COWORLD_LLM_ENABLED=true` or a non-empty `PLAYER_PROMPT` (without `PLAYER_SCRIPTED`) selects an
+LLM seat.
 
 ### What a seat sends and receives
 
@@ -102,14 +105,16 @@ the next round's mode, mark layout, colour permutation, goal and key.
 
 ### Reply
 
-See `docs/RULES.md` §Orders for the schema and the per-field caps. Parsing is tolerant: markdown
-fences are stripped, the outermost balanced `{…}` is taken if the model prefixed prose, `cogs` is
-accepted as an id-keyed object, numeric strings are accepted for coordinates, and the intent is
-normalised. Only when no object with at least one usable entry can be recovered do the single retry
-and then the scripted fallback fire.
+See `docs/RULES.md` §Orders for the schema and the per-field caps. Parsing is strict: the reply
+must be a single JSON object starting with `{` and ending with `}`, with `cogs` as a 1-element
+array naming the seat's own alias, a legal `intent`, a 2-element numeric `target` array (clamped to
+the field), an optional `null` or `[x, y]` `face`, and a legal `symbol` (`-` or `A..H`). Invalid
+replies trigger a single retry; if an LLM seat still fails (invalid output, timeout, throttle,
+unavailable endpoint, or auth error), the game declares a terminal player failure via
+`COGAME_PLAYER_FAILURE_URI` and exits without executing a substitute move or publishing scores.
 
 Every recorded string is truncated on **rune** (Unicode codepoint) boundaries, never bytes:
-`note` ≤ 160 runes, `register.policy` ≤ 48, `fallback.detail` ≤ 200, the whole serialized
+`note` ≤ 160 runes, `register.policy` ≤ 48, the whole serialized
 `directive` record ≤ 900, and `register.prompt` ≤ 4000 at the transport (truncated, never
 rejected, and never written to the replay or the results).
 

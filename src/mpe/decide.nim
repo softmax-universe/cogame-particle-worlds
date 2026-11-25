@@ -1,23 +1,18 @@
-## The decision layer: the per-turn loop that asks both commanders what their
-## squads do next, and always has an answer.
+## The decision layer: the per-turn loop that asks LLM seats what their
+## particles do next, and runs explicit scripted baselines for scripted seats.
 ##
 ## Cadence: one turn every `turnTicks` (108 ticks = 4.5 s of sim time), 10
-## turns per round, 40 per episode. At each turn the server builds ALL FOUR
+## turns per round, 40 per episode. At each turn the server builds all LLM
 ## seats' request bodies and issues them as ONE parallel batch
 ## (`curl.makeRequests`) — particle worlds is a SIMULTANEOUS-decision game, so
 ## querying seats one after another would quadruple the wall clock for no gain.
-## One call per seat per turn; an episode is at most 160 calls, at most 4 in
-## flight.
 ##
-## DEGRADE, NEVER HANG. Every wait here is bounded: attempt 1 gets
-## `attempt1Ms`, the single retry gets `retryMs`, and the whole turn is
-## wrapped in a monotonic `turnBudgetMs` deadline. A provider throttle with no
-## other candidate model skips the retry outright (it cannot land) and fails
-## fast to the scripted layer for that turn. On a second failure the seat
-## plays the `drifter` scripted directive for that turn and a `fallback`
-## record names the cause. No failure mode leaves a particle unactuated: the
-## control layer always has a directive — this turn's, else last turn's, else
-## `drifter`'s.
+## NO FABRICATED MOVES. Every wait is bounded (`attempt1Ms`, `retryMs`,
+## `turnBudgetMs`). If an LLM seat cannot produce a valid directive (missing
+## credentials/endpoint, auth failure, throttle, timeout, transport error, or
+## invalid reply after the single retry), the turn records `engine.policyFailure`
+## and returns immediately with NO substitute move so the server terminates the
+## episode as an explicit policy failure with no participant scores.
 
 import
   std/[json, math, monotimes, os, strutils, times],
@@ -26,13 +21,19 @@ import
 
 type
   SeatPolicy* = object
-    ## What one seat registered as. A seat that registers with neither field
-    ## — or never registers at all — is `drifter`.
+    ## What one seat registered as.
     isLlm*: bool
     prompt*: string
+    model*: string
     baseline*: Baseline
     label*: string
     registered*: bool
+
+  PolicyFailure* = object
+    failed*: bool
+    seat*: int
+    cause*: string
+    detail*: string
 
   DecisionEngine* = object
     capture*: RuntimeCapture
@@ -44,7 +45,7 @@ type
     haveDirective*: seq[bool]
     lastBatchStart*: MonoTime
     batchStarted*: bool
-    llmOff*: bool              ## the budget guard fired; scripted from here on
+    policyFailure*: PolicyFailure
     records*: seq[string]      ## chat records queued for the replay writer
 
 proc initDecisionEngine*(sim: SimServer, selection: PromptSelection): DecisionEngine =
@@ -230,19 +231,6 @@ proc seatViewJson*(
 #  Records
 # ---------------------------------------------------------------------------
 
-proc fallbackRecord(
-  roundIndex, turn, seat, attempt: int, cause, detail: string
-): string =
-  $(%*{
-    "k": "fallback",
-    "round": roundIndex,
-    "turn": turn,
-    "seat": seat,
-    "attempt": attempt,
-    "cause": cause,
-    "detail": detail.truncateRunes(MaxFallbackDetailRunes)
-  })
-
 proc registerRecord*(
   seat: int, alias, colour, policy, kind, baseline: string
 ): string =
@@ -305,76 +293,20 @@ proc resultRecord*(sim: SimServer): string =
   ## artifact writes may raise.
   "{\"k\":\"result\",\"results\":" & sim.playerResultsJson() & "}"
 
-proc budgetGuardRecord(turn, remainingSeconds: int): string =
-  $(%*{"k": "budget_guard", "turn": turn, "remaining_s": remainingSeconds})
-
 # ---------------------------------------------------------------------------
 #  The turn
 # ---------------------------------------------------------------------------
 
-proc scriptedFor(
+proc scriptedFor*(
   engine: DecisionEngine, sim: SimServer, seat: int, kind: Baseline
 ): SquadDirective =
   scriptedDirective(engine.ctl, sim, kind, sim.commandedCogs(seat))
 
-proc holdFallbackDirective*(sim: SimServer, cogs: seq[int]): SquadDirective =
-  ## Neutral hold directive for scored LLM failures (never runs `drifter`).
-  result = SquadDirective(source: dsFallback)
-  for cogIndex in cogs:
-    let px = sim.players[cogIndex].x + CollisionW div 2
-    let py = sim.players[cogIndex].y + CollisionH div 2
-    result.orders.add(CogOrder(
-      cogIndex: cogIndex,
-      id: sim.cogAlias(cogIndex),
-      intent: intHold,
-      targetX: px,
-      targetY: py,
-      symbol: 0,
-      fromReply: false
-    ))
-
 proc drifterFor*(
   engine: DecisionEngine, sim: SimServer, cogs: seq[int]
 ): SquadDirective =
-  ## The published `drifter` directive for an arbitrary particle set — the
-  ## per-turn fallback, the driver of a no-show or disconnected seat, and the
-  ## default for a seat that registered with neither field.
+  ## The published `drifter` directive for an explicit scripted particle set.
   scriptedDirective(engine.ctl, sim, blDrifter, cogs)
-
-proc repairMissingOrders*(
-  engine: DecisionEngine, sim: SimServer, seat: int,
-  directive: var SquadDirective
-) =
-  ## Design §Reply schema, the `cogs` row: "extra entries dropped; a missing
-  ## entry keeps LAST turn's directive, else `drifter`'s". The parser fills an
-  ## unnamed particle with `go` at the field centre so no particle is ever left
-  ## unactuated; that default is a floor, not the rule — a seat that names
-  ## nothing usable meant to carry on, not to abandon its post and drift to the
-  ## middle.
-  var previous: seq[CogOrder]
-  if seat < engine.haveDirective.len and engine.haveDirective[seat]:
-    previous = engine.directives[seat].orders
-  var
-    drifter: SquadDirective
-    builtDrifter = false
-  for order in directive.orders.mitems:
-    if order.fromReply:
-      continue
-    var repaired = false
-    for old in previous:
-      if old.cogIndex == order.cogIndex:
-        order = old                  ## last turn's directive for this cog
-        repaired = true
-        break
-    if repaired:
-      continue
-    if not builtDrifter:
-      drifter = engine.drifterFor(sim, sim.commandedCogs(seat))
-      builtDrifter = true
-    for fallback in drifter.orders:
-      if fallback.cogIndex == order.cogIndex:
-        order = fallback             ## else drifter's
-        break
 
 proc turn*(
   engine: var DecisionEngine,
@@ -382,41 +314,16 @@ proc turn*(
   turnIndex, turnsPerRound: int,
   elapsedSeconds: int
 ): seq[string] =
-  ## Runs ONE decision turn and installs each seat's directive. Returns the
-  ## replay chat records this turn produced. Never raises: every failure path
-  ## ends in a legal directive.
-  let
-    roundIndex = sim.roundIndex + 1
-    budget = initDuration(milliseconds = max(1, sim.config.turnBudgetMs))
-  ## The per-turn monotonic deadline. It clocks the CALLS, and it is (re)started
-  ## below, after the rate floor's wait -- see the rate floor for why.
+  ## Runs ONE decision turn and installs each seat's directive. Explicit
+  ## scripted seats run their chosen baseline. LLM seats must return a strict,
+  ## valid directive within the bounded budget; any failure records
+  ## `engine.policyFailure` with NO substitute move so the server terminates
+  ## the episode as an explicit policy failure without publishing scores.
+  discard elapsedSeconds
+  let budget = initDuration(milliseconds = max(1, sim.config.turnBudgetMs))
   var turnStart = getMonoTime()
-  ## Throttle state is PER TURN: a daily-token 429 on turn k says nothing
-  ## about turn k+1 (the sidecar's window may have rolled), so the flag is
-  ## cleared here and only suppresses this turn's retry.
   engine.client.throttled = false
-
-  # --- budget guard: settle EARLY rather than overrun -----------------------
-  # If two more full turns would not fit inside the engine's own wall-clock
-  # stop, switch the LLM off for the rest of the episode and finish on the
-  # scripted layer (microseconds per turn), so the episode ends
-  # complete/full_time instead of deadline.
-  #
-  # A full turn is the rate floor PLUS the calls: the floor holds batch STARTS
-  # `turnSpacingMs` apart and the monotonic budget then clocks `turnBudgetMs`
-  # of calls from the moment the wait ends, so the worst single turn costs
-  # 9 s + 10 s = 19 s, not 10 s. Reserving 2 x 10 s left the last callable turn
-  # ending ~2 s inside the 690 s stop; reserving 2 x 19 s makes the guard's
-  # margin the one its expression claims.
-  if not engine.llmOff:
-    let turnSeconds =
-      (sim.config.turnSpacingMs + sim.config.turnBudgetMs + 999) div 1000
-    if elapsedSeconds + 2 * turnSeconds > sim.config.wallClockBudgetSeconds:
-      engine.llmOff = true
-      result.add(budgetGuardRecord(
-        turnIndex, max(0, sim.config.wallClockBudgetSeconds - elapsedSeconds)))
-      echo "particle-worlds: budget guard fired at turn ", turnIndex,
-        "; remaining turns play scripted"
+  engine.policyFailure = PolicyFailure()
 
   if engine.capture != nil:
     var observations: seq[JsonNode]
@@ -427,26 +334,20 @@ proc turn*(
   # --- which seats need a call? --------------------------------------------
   var open: seq[int]
   for seat in 0 ..< engine.seats.len:
-    if engine.seats[seat].isLlm and not engine.llmOff and
-        not engine.client.disabled:
+    if engine.seats[seat].isLlm:
+      if engine.client.disabled:
+        let detail = "LLM endpoint/credentials unavailable for model seat " & $seat
+        engine.capture.failedDecision(seat, sim.tickCount)
+        engine.policyFailure = PolicyFailure(
+          failed: true,
+          seat: seat,
+          cause: "no_credentials",
+          detail: detail
+        )
+        echo "particle-worlds llm: seat ", seat,
+          " terminal policy failure (no_credentials): ", detail
+        return
       open.add(seat)
-    elif engine.seats[seat].isLlm:
-      # An LLM seat that CANNOT call the LLM this turn is a fallback, not a
-      # scripted policy, and the design's `fallback.cause` enum names both
-      # reasons it happens (`no_credentials`, `budget_guard`). Recording it is
-      # what makes the two countable: without this an LLM seat with no key
-      # reported llmTurns 0 AND fallbackTurns 0, and replay_summary.py's
-      # `fallbacks` was 0 for an episode in which nothing but fallbacks
-      # happened. A seat that registered as SCRIPTED is not a fallback and
-      # gets no record (which is why certification's two baseline seats write
-      # none).
-      engine.directives[seat] = holdFallbackDirective(sim, sim.commandedCogs(seat))
-      engine.haveDirective[seat] = true
-      let cause = if engine.llmOff: "budget_guard" else: "no_credentials"
-      result.add(fallbackRecord(roundIndex, turnIndex, seat, 1, cause,
-        "the LLM is unavailable for this turn; holding position"))
-      echo "particle-worlds llm: seat ", seat, " falling back to neutral hold (", cause,
-        ") on turn ", turnIndex
     else:
       var directive = engine.scriptedFor(
         sim, seat, engine.seats[seat].baseline)
@@ -455,11 +356,6 @@ proc turn*(
       engine.haveDirective[seat] = true
 
   # --- the rate floor -------------------------------------------------------
-  # The Bedrock sidecar caps 30 requests/minute PER EPISODE, and FOUR seats per
-  # turn blow through it at any fast cadence. Hold the START of consecutive
-  # batches `turnSpacingMs` apart, which pins the episode at
-  # 4 x 60 / 9 = 26.7 req/min. The cert fixture sets it to 0, so offline runs
-  # pay nothing.
   if open.len > 0 and engine.batchStarted and sim.config.turnSpacingMs > 0:
     let since = (getMonoTime() - engine.lastBatchStart).inMilliseconds.int
     if since < sim.config.turnSpacingMs:
@@ -467,33 +363,12 @@ proc turn*(
   if open.len > 0:
     engine.lastBatchStart = getMonoTime()
     engine.batchStarted = true
-    # The rate floor is a WAIT, not work, so the per-turn budget starts HERE,
-    # when the first batch of the turn does. It has to: `turnBudgetMs` is the
-    # cap sim_config validates `attempt1Ms + retryMs` against (10 000 against
-    # 6000 + 3000 on every shipped variant), and the floor is 9000 ms of the
-    # same window. Clocking the sleep inside the budget left roughly 3.5 s of
-    # it in steady state, so a turn whose attempt 1 TIMED OUT was already past
-    # the deadline and broke out with a budget-exhausted record: the single
-    # retry the acceptance checklist requires could never be issued at the
-    # shipped settings. Batch STARTS are still held turnSpacingMs apart -- that
-    # is what the rate floor promises the sidecar -- so a turn still costs at
-    # most max(turnSpacingMs, turnBudgetMs) of wall clock and 40 turns still
-    # settle far inside the 690 s engine stop.
     turnStart = engine.lastBatchStart
 
   # --- up to two PARALLEL batches ------------------------------------------
-  ## ONE `fallback` record per seat per turn, written by the tail block below.
-  ## Each failed attempt records WHY here instead of emitting its own record:
-  ## `results.fallbackTurns` counts seat-turns, so a stream that carried two or
-  ## three records for one seat-turn (and, on the budget-exhausted path, two
-  ## records both stamped attempt 2 with different causes) made
-  ## replay_summary.py's `fallbacks` disagree with it and phase 60 unable to
-  ## read either. The record's `attempt` is now how many attempts the seat
-  ## actually spent, 1 or 2, and its `cause` is the one that ended the turn.
   var
     lastCause = newSeq[string](engine.seats.len)
     lastDetail = newSeq[string](engine.seats.len)
-    attemptsSpent = newSeq[int](engine.seats.len)
   var attempt = 0
   while open.len > 0 and attempt < 2:
     if engine.client.disabled:
@@ -514,18 +389,12 @@ proc turn*(
           "the JSON object described above, starting with '{', with exactly " &
           "one \"cogs\" entry, for yourself.")
       let request = engine.client.requestFor(
-        systemPrompt(engine.selection), userMessage(engine.seats[seat].prompt, user), seat)
+        systemPrompt(engine.selection),
+        userMessage(engine.seats[seat].prompt, user),
+        seat,
+        engine.seats[seat].model)
       batch.post(request.url, request.headers, request.body, $seat)
     let started = getMonoTime()
-    # curly hands the deadline to CURLOPT_TIMEOUT, whose granularity is WHOLE
-    # SECONDS, so this conversion FLOORS — and a config that is not a whole
-    # number of seconds is therefore not the deadline it claims to be. 0.1.2
-    # shipped `attempt1Ms: 4500` and really ran with 4 s against a sidecar
-    # whose median call measured 4618 ms; every successful LLM directive in
-    # that release reported a latency of 3999–4001 ms, i.e. it was the
-    # deadline answering, not the model. sim_config now REJECTS a sub-second
-    # value, so the floor below is an identity: 6000 -> 6 s, 3000 -> 3 s,
-    # worst case 9 s inside the 10 s turnBudgetMs cap.
     let responses = engine.client.curl.makeRequests(
       batch, max(1, deadlineMs div 1000))
     let latency = (getMonoTime() - started).inMilliseconds.int
@@ -533,7 +402,9 @@ proc turn*(
     for position, seat in open:
       var cause = "parse_error"
       var evidence = modelAttempt($sim.tickCount & "-" & $seat & "-" & $(attempt + 1),
-        engine.seats[seat].label, engine.client.requestedModel(), batch[position].url,
+        engine.seats[seat].label,
+        engine.client.requestedModel(engine.seats[seat].model),
+        batch[position].url,
         batch[position].body, responses[position].response, responses[position].error, latency)
       try:
         let text = engine.client.textOf(
@@ -551,70 +422,58 @@ proc turn*(
         directive.source = dsLlm
         directive.latencyMs = latency
         evidence.parsedAction = directive.actionJson()
-        var completeModelOrder = directive.orders.len > 0
-        for order in directive.orders:
-          if not order.fromReply: completeModelOrder = false
-        engine.repairMissingOrders(sim, seat, directive)
+        evidence.accepted = true
         engine.directives[seat] = directive
         engine.haveDirective[seat] = true
-        evidence.accepted = completeModelOrder and evidence.parsedAction == directive.actionJson()
-        if not evidence.accepted:
-          evidence.rejectionReason = some("engine repaired missing orders")
       except CatchableError as error:
         evidence.rejectionReason = some(error.msg)
         if responses[position].error.len > 0:
           cause = (if "timeout" in responses[position].error.toLowerAscii():
                      "timeout" else: "transport_error")
         elif error.msg.startsWith("llm throttled"):
-          ## Name the throttle for what it is. Reporting a 429 as
-          ## `parse_error` is what made the hosted log unreadable: 205
-          ## "falling back (parse_error)" lines for an episode whose only
-          ## fault was a daily-token cap.
           cause = "throttled"
+        elif error.msg.startsWith("llm auth failed"):
+          cause = "auth_error"
         lastCause[seat] = cause
         lastDetail[seat] = error.msg
-        attemptsSpent[seat] = attempt + 1
         echo "particle-worlds llm: seat ", seat, " attempt ", attempt + 1,
-          " failed, falling back if it fails again: ", error.msg
+          " failed: ", error.msg
         stillOpen.add(seat)
       engine.capture.recordAttempt(seat, evidence)
     open = stillOpen
     inc attempt
     if engine.client.throttled and open.len > 0:
-      # FAIL FAST. The only model left answered 429, so the retry batch would
-      # be refused the same way: spend the rest of the turn on the scripted
-      # layer instead of on a call that cannot land. Bounded, and recorded as
-      # a `fallback` with cause `throttled` by the block below.
       echo "particle-worlds llm: provider throttled with no other candidate; ",
-        open.len, " seat(s) fall back for turn ", turnIndex
+        open.len, " seat(s) failed on turn ", turnIndex
       break
 
-  # --- anything still open holds position (never plays scripted drifter) ---
-  for seat in open:
-    engine.directives[seat] = holdFallbackDirective(sim, sim.commandedCogs(seat))
-    engine.haveDirective[seat] = true
+  # --- any seat still open is a terminal policy failure (no substitute move)
+  if open.len > 0:
+    for seat in open:
+      engine.capture.failedDecision(seat, sim.tickCount)
+    let failedSeat = open[0]
     let cause =
-      if engine.client.disabled or engine.client.transport == ltNone:
-        "no_credentials"
-      elif engine.llmOff: "budget_guard"
+      if lastCause[failedSeat].len > 0: lastCause[failedSeat]
+      elif engine.client.disabled or engine.client.transport == ltNone: "no_credentials"
       elif engine.client.throttled: "throttled"
-      elif lastCause[seat].len > 0: lastCause[seat]
       else: "parse_error"
     let detail =
-      if lastDetail[seat].len > 0: lastDetail[seat]
-      else: "seat fell back to neutral hold"
-    ## The one authoritative record for this seat-turn: `attempt` is how many
-    ## attempts it spent (1 when the retry never went out -- a throttle, a
-    ## disabled client or an exhausted budget -- 2 when it did).
-    result.add(fallbackRecord(roundIndex, turnIndex, seat,
-      max(1, attemptsSpent[seat]), cause, detail))
-    ## "falling back" is the phrase phase 60 greps the GAME log for.
-    echo "particle-worlds llm: seat ", seat, " falling back to neutral hold (", cause,
-      ") on turn ", turnIndex
+      if lastDetail[failedSeat].len > 0:
+        lastDetail[failedSeat].truncateRunes(MaxFallbackDetailRunes)
+      else: "model failed to produce a valid directive"
+    engine.policyFailure = PolicyFailure(
+      failed: true,
+      seat: failedSeat,
+      cause: cause,
+      detail: detail
+    )
+    echo "particle-worlds llm: seat ", failedSeat,
+      " terminal policy failure (", cause, ") on turn ", turnIndex, ": ", detail
+    return
 
   for seat in 0 ..< engine.seats.len:
     let origin = if engine.directives[seat].source == dsLlm: aoModel
-      elif engine.directives[seat].source == dsScripted and engine.seats[seat].registered: aoTeacher
-      else: aoFallback
+      else: aoTeacher
     engine.capture.applied(seat, sim.tickCount, engine.directives[seat].actionJson(), origin,
-      if origin == aoTeacher: "scripted-" & $engine.seats[seat].baseline else: "engine-particle-worlds-fallback")
+      if origin == aoTeacher: "scripted-" & $engine.seats[seat].baseline
+      else: engine.seats[seat].label)

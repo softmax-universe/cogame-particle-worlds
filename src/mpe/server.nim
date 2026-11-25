@@ -1214,11 +1214,12 @@ proc declarePlayerFailure(slot: int, message: string) =
 
 proc parseRegistration(
   text: string
-): tuple[ok: bool, prompt, scripted, policy: string] =
+): tuple[ok: bool, llm: bool, model, prompt, scripted, policy: string] =
   ## A seat's ONE Sprite v1 chat message, read as its registration:
-  ##   {"type":"register","prompt":"…","scripted":"drifter"|null,"policy":"…"}
+  ##   {"type":"register","llm":true|false,"model":"...","prompt":"…",
+  ##    "scripted":"drifter"|null,"policy":"…"}
   ## Anything that is not that object is not a registration.
-  result = (false, "", "", "")
+  result = (false, false, "", "", "", "")
   if text.len == 0 or text[0] != '{':
     return
   var node: JsonNode
@@ -1229,6 +1230,10 @@ proc parseRegistration(
   if node.kind != JObject or node{"type"}.getStr() != "register":
     return
   result.ok = true
+  if not node{"llm"}.isNil and node{"llm"}.kind == JBool:
+    result.llm = node{"llm"}.getBool()
+  if not node{"model"}.isNil and node{"model"}.kind == JString:
+    result.model = node{"model"}.getStr().strip()
   result.prompt = node{"prompt"}.getStr()
   if not node{"scripted"}.isNil and node{"scripted"}.kind == JString:
     result.scripted = node{"scripted"}.getStr()
@@ -1538,19 +1543,21 @@ proc runServerLoop*(
             sim.removePlayer(websocket)
             socketsToClose.add(websocket)
         if squadMode and not squadsBuilt and sim.lobbyJoinTimedOut():
-          # A seat that never connects does NOT end the episode. Report the
-          # no-show to the platform (lowest missing slot only), then build the
-          # squads anyway: that seat's cogs run the published holdline
-          # baseline for the whole episode and both games play to full time.
+          # A seat that never connects terminates the episode as an explicit
+          # player failure without publishing participant scores.
           let stuckSlot = sim.nextPlayerSlot()
           declarePlayerFailure(
             stuckSlot,
             "player slot " & $stuckSlot & " never joined the lobby within " &
               $sim.config.lobbyJoinTimeoutTicks & " lobby ticks (~" &
-              $(sim.config.lobbyJoinTimeoutTicks div TargetFps) &
-              "s); its squad plays the holdline baseline"
+              $(sim.config.lobbyJoinTimeoutTicks div TargetFps) & "s)"
           )
-          squadForceStart = true
+          raise newException(
+            MpeError,
+            "lobby join timeout: slot " & $stuckSlot &
+              " never joined within " & $sim.config.lobbyJoinTimeoutTicks &
+              " lobby ticks"
+          )
         if not replayLoaded and not squadMode and sim.lobbyJoinTimedOut():
           # Joins are strictly slot-sequential, so the seat the lobby is stuck
           # waiting on is exactly nextPlayerSlot(). Declare it before dying so
@@ -1758,11 +1765,14 @@ proc runServerLoop*(
               let firstRegistration = not policy.registered
               policy.registered = true
               policy.prompt = registration.prompt.truncateRunes(MaxPromptRunes)
-              policy.isLlm = policy.prompt.len > 0
+              policy.model = registration.model.truncateRunes(128)
+              policy.isLlm =
+                (registration.scripted.len == 0) and
+                (registration.llm or policy.prompt.len > 0)
               policy.baseline = parseBaseline(registration.scripted)
               policy.label =
                 if registration.policy.len > 0: registration.policy
-                elif policy.isLlm: "prompt"
+                elif policy.isLlm: "model"
                 else: $policy.baseline
               engine.seats[playerIndex] = policy
               if playerIndex <= sim.seatPolicyKind.high:
@@ -1949,6 +1959,17 @@ proc runServerLoop*(
         let turnsPerRound =
           if config.maxTicks > 0: max(1, config.maxTicks div turnTicks) else: 0
         let records = engine.turn(sim, turnIndex, turnsPerRound, elapsedSeconds)
+        if engine.policyFailure.failed:
+          let failure = engine.policyFailure
+          let msg = "model policy failure on seat " & $failure.seat & " (" &
+            failure.cause & "): " & failure.detail
+          echo "particle-worlds: ", msg
+          declarePlayerFailure(failure.seat, msg)
+          engine.capture.finishFailed(failure.seat, failure.cause, failure.detail)
+          replayWriter.closeReplayWriter()
+          httpServer.close()
+          joinThread(serverThread)
+          quit(1)
         for record in records:
           replayWriter.writeChat(tickTime(sim.tickCount), 0, record)
         for seat in 0 ..< engine.directives.len:
@@ -1997,9 +2018,16 @@ proc runServerLoop*(
               found = true
               break
         if not found:
-          # This seat has no directive yet (turn 0 has not landed, or the
-          # seat never connected). It plays the published `drifter` baseline,
-          # so no particle is ever unactuated.
+          if seat >= 0 and seat < engine.seats.len and engine.seats[seat].isLlm:
+            let msg = "model policy failure on seat " & $seat &
+              " (missing_directive): no valid directive available"
+            echo "particle-worlds: ", msg
+            declarePlayerFailure(seat, msg)
+            engine.capture.finishFailed(seat, "missing_directive", msg)
+            replayWriter.closeReplayWriter()
+            httpServer.close()
+            joinThread(serverThread)
+            quit(1)
           let scripted = engine.drifterFor(sim, @[cogIndex])
           if scripted.orders.len > 0:
             order = scripted.orders[0]

@@ -329,10 +329,10 @@ def variant_config(rounds: list[str]) -> dict:
 
 
 def certification() -> dict:
-    # All four seats scripted, no LLM, no rate floor, 4 x 240 ticks = 960 ticks = 40 s of
-    # playback at 24 fps -- deliberately LONGER than any viewer soak window (the ecos
-    # 2026-08-23 scar) while fastMode plays it in a handful of wall seconds. All four modes
-    # appear, so the fixture's replay exercises every readout and every beat kind.
+    # Seat 0 is the real model player (COWORLD_LLM_ENABLED=true); seats 1..3 are explicit
+    # scripted baseline opponents. 4 x 240 ticks = 960 ticks = 40 s of playback at 24 fps --
+    # deliberately LONGER than any viewer soak window while fastMode plays it quickly.
+    # All four modes appear, so the fixture's replay exercises every readout and every beat kind.
     game_config = {
         "players": [{"name": f"P{i + 1}"} for i in range(SEATS)],
         "slots": [
@@ -361,10 +361,14 @@ def certification() -> dict:
         "showPlayerLabels": False,
     }
     return {
-        # Every DECLARED player entry must occupy a certification slot (the raid 0.1.2
-        # players_missing scar). `baseline` is the only declared player, and it is seated in
-        # all four slots.
-        "players": [{"player_id": "baseline"} for _ in range(SEATS)],
+        # Every DECLARED player entry must occupy a certification slot.
+        # Slot 0 is the real model seat; slots 1..3 are explicit scripted baselines.
+        "players": [
+            {"player_id": "model"},
+            {"player_id": "baseline"},
+            {"player_id": "baseline"},
+            {"player_id": "baseline"},
+        ],
         "game_config": game_config,
     }
 
@@ -433,6 +437,31 @@ def manifest() -> dict:
         },
         "player": [
             {
+                "id": "model",
+                "type": "player",
+                "name": "Particle Worlds Model Player",
+                "description": (
+                    "LLM-backed particle policy: calls the configured model through the "
+                    "native Coworld LLM sidecar every turn with strict JSON validation and "
+                    "no scripted fallback."
+                ),
+                "image": IMAGE_PLACEHOLDER,
+                "run": ["/bin/particle-worlds-player"],
+                "env": {
+                    "COWORLD_LLM_ENABLED": "true",
+                    "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
+                    "PLAYER_PROMPT": (
+                        "Use your role, observations, and public radio to coordinate your particle."
+                    ),
+                    "PLAYER_POLICY_LABEL": "model",
+                },
+                "source_url": SOURCE_URL,
+                "resources": {
+                    "requests": {"cpu": "100m", "memory": "64Mi"},
+                    "limits": {"cpu": "1"},
+                },
+            },
+            {
                 "id": "baseline",
                 "type": "player",
                 "name": "Drifter Baseline",
@@ -449,7 +478,7 @@ def manifest() -> dict:
                     "requests": {"cpu": "100m", "memory": "64Mi"},
                     "limits": {"cpu": "1"},
                 },
-            }
+            },
         ],
         "variants": [
             {

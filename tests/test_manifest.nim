@@ -48,14 +48,34 @@ suite "the manifest":
     check cert["game_config"]["slots"].len == FixtureSeats
     check not cert["game_config"].hasKey("tokens")
     ## EVERY declared player must occupy a certification slot (the raid 0.1.2
-    ## players_missing scar).
+    ## players_missing scar), and the manifest must expose BOTH an explicit
+    ## model player (COWORLD_LLM_ENABLED=true) and an explicit scripted baseline.
     var declared: HashSet[string]
+    var modelPlayers = 0
+    var baselinePlayers = 0
     for player in manifest["player"]:
-      declared.incl(player["id"].getStr())
+      let pid = player["id"].getStr()
+      declared.incl(pid)
+      let penv = player["env"]
+      if penv.hasKey("COWORLD_LLM_ENABLED") and
+          penv["COWORLD_LLM_ENABLED"].getStr() == "true":
+        inc modelPlayers
+        check penv.hasKey("COWORLD_LLM_MODEL")
+        check penv["COWORLD_LLM_MODEL"].getStr().len > 0
+        check not penv.hasKey("PLAYER_SCRIPTED")
+      else:
+        inc baselinePlayers
+        check penv.hasKey("PLAYER_SCRIPTED")
+        check not penv.hasKey("COWORLD_LLM_ENABLED")
+    check modelPlayers == 1
+    check baselinePlayers == 1
     var seated: HashSet[string]
     for slot in cert["players"]:
       seated.incl(slot["player_id"].getStr())
     check declared == seated
+    check cert["players"][0]["player_id"].getStr() == "model"
+    for i in 1 ..< FixtureSeats:
+      check cert["players"][i]["player_id"].getStr() == "baseline"
 
   test "results_schema keys == particleResultsJson keys, both directions":
     var sim = seatedSim(fixtureConfig())
