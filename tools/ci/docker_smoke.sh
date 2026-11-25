@@ -67,6 +67,9 @@ work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
 
 cleanup() {
+  if [ -n "${mock_pid:-}" ]; then
+    kill "${mock_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,16 +194,60 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+mock_pid=""
+mock_log="${work_dir}/mock_sidecar.jsonl"
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  echo "COWORLD_LLM_ENDPOINT present: the live LLM sidecar path will be exercised"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
-  echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
+  echo "ANTHROPIC_API_KEY present: the live Anthropic path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  mock_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("0.0.0.0",0)); print(s.getsockname()[1]); s.close()')"
+  python3 - "${mock_port}" "${mock_log}" <<'PY' &
+import json, re, sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+port, log_path = int(sys.argv[1]), sys.argv[2]
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        slot = self.headers.get("X-Coworld-Player-Slot", "")
+        user_msg = body["messages"][0]["content"]
+        m = re.search(r'"you":\s*\{[^}]*"id":\s*"([^"]+)"', user_msg)
+        alias = m.group(1) if m else "RED-alpha"
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"slot": slot, "model": body.get("model"), "alias": alias}) + "\n")
+        directive = json.dumps({
+            "note": "ci smoke model move",
+            "cogs": [{"id": alias, "intent": "cover", "target": [617, 329], "face": None, "symbol": "A"}],
+        })
+        reply = json.dumps({"content": [{"type": "text", "text": directive}]}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+
+ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+PY
+  mock_pid="$!"
+  sleep 0.5
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${mock_port}")
+  echo "no live LLM credentials: using local mock sidecar at http://host.docker.internal:${mock_port}"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
 docker run -d --name "${prefix}-game" \
   --network "${network}" --network-alias "${prefix}-game" \
+  --add-host=host.docker.internal:host-gateway \
   -e COGAME_HOST=0.0.0.0 \
   -e COGAME_PORT="${port}" \
   -e COGAME_CONFIG_URI=file:///coworld/config.json \
@@ -306,6 +353,25 @@ for key in ("names", "scores"):
 reason = results.get("reason") or results.get("end_reason")
 if reason is not None:
     print(f"episode end reason: {reason}")
+
+llm_turns = results.get("llmTurns") or []
+fb_turns = results.get("fallbackTurns") or []
+if len(llm_turns) == seats:
+    if llm_turns[0] <= 0:
+        raise SystemExit(f"expected model seat 0 to record llmTurns > 0, got {llm_turns}")
+    if any(t != 0 for t in llm_turns[1:]):
+        raise SystemExit(f"expected scripted baseline seats 1..3 to record 0 llmTurns, got {llm_turns}")
+if any(t != 0 for t in fb_turns):
+    raise SystemExit(f"expected zero fallbackTurns, got {fb_turns}")
+mock_log = work / "mock_sidecar.jsonl"
+if mock_log.exists():
+    calls = [json.loads(line) for line in mock_log.read_text().splitlines() if line.strip()]
+    if not calls:
+        raise SystemExit("mock sidecar recorded zero calls")
+    slots = {c.get("slot") for c in calls}
+    if slots != {"0"}:
+        raise SystemExit(f"expected sidecar calls only from model seat 0, got slots={slots}")
+    print(f"mock sidecar verified: {len(calls)} calls from slot 0, models={sorted({c.get('model') for c in calls})}")
 
 replay_path = work / "replay.json"
 if not replay_path.exists() or replay_path.stat().st_size == 0:

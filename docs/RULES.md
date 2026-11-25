@@ -176,15 +176,15 @@ Every 4.5 s a seat issues one order for itself:
            "face": [700, 420], "symbol": "F"}]}
 ```
 
-| Field | Cap / legal values | Repair when violated |
+| Field | Cap / legal values | Validation |
 | --- | --- | --- |
-| `note` | ≤ 160 runes, **spectator-only** | truncated on a rune boundary; newlines collapse to spaces |
-| `cogs` | exactly 1 entry, your own particle | extra entries dropped; empty keeps last turn's order, else `drifter`'s |
-| `cogs[].id` | your own alias, matched case-insensitively and suffix-wise | an unmatched entry is assigned by position |
-| `cogs[].intent` | `go` `hold` `cover` `shadow` `evade` `orbit` | normalised; still unknown → `go` |
-| `cogs[].target` | `[int, int]`, clamped to `[0,1234] x [0,658]` | missing / non-finite → the field centre |
-| `cogs[].face` | `[int, int]` or `null` | → `null` (the controller picks the facing) |
-| `cogs[].symbol` | exactly one rune from `{-,A..H}` | first rune upper-cased; outside the alphabet → `-` |
+| `note` | ≤ 160 runes, **spectator-only** | optional string or `null`; truncated on a rune boundary; newlines collapse to spaces |
+| `cogs` | array of exactly 1 object, your own particle | any other type or length is rejected |
+| `cogs[].id` | your own alias (case-insensitive exact match) | missing or mismatched id is rejected |
+| `cogs[].intent` | `go` `hold` `cover` `shadow` `evade` `orbit` | unknown or missing intent is rejected |
+| `cogs[].target` | `[int, int]`, clamped to `[0,1234] x [0,658]` | missing, non-array, or non-finite coordinate is rejected |
+| `cogs[].face` | `[int, int]` or `null` (optional) | invalid non-null value is rejected |
+| `cogs[].symbol` | `"-"` or one letter from `A..H` | any other value is rejected |
 
 A deterministic controller executes the order for the next 4.5 s:
 
@@ -236,6 +236,7 @@ round played and is a closed enum of four.
 | `fault` | `sim_fault` | the sim guard tripped. Scored from the banked rounds, `win` false everywhere, partial replay written. |
 | `fault` | `host_error` | an unexpected server-side exception. Same treatment. |
 
-A seat that never connects does **not** end the episode: the lobby budget expires, the no-show is
-reported, its particle plays `drifter` for the whole episode, and all four rounds run. A seat that
-drops mid-episode keeps playing on `drifter` and revives on reconnect.
+A seat that never connects, or an LLM seat that fails to produce a valid order (unavailable
+endpoint, timeout, throttle, or invalid output after the single retry), terminates the episode as
+an explicit policy failure via `COGAME_PLAYER_FAILURE_URI` with no substitute move and no
+participant scores published.

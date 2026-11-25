@@ -1,6 +1,5 @@
-## The directive schema: what a commander (LLM or scripted) may say, how a
-## reply is parsed TOLERANTLY, and how an illegal reply is repaired instead of
-## rejected.
+## The directive schema: what a commander (LLM or scripted) may say, and strict
+## parsing of model replies with no fabricated actions or silent coercions.
 ##
 ## Both policy kinds emit the SAME object, so the two are strictly comparable
 ## and one validator covers both — that is what makes the bounded-orders test
@@ -70,30 +69,20 @@ proc truncateRunes*(text: string, limit: int): string =
   text.runeSubStr(0, limit)
 
 proc parseSymbol*(text: string): int =
-  ## The radio's whole vocabulary, parsed tolerantly: take the FIRST rune,
-  ## upper-case it, and accept it only if it is one of A..H. Anything else —
-  ## a lower-case letter that is not in the alphabet, a two-character string,
-  ## an emoji, an empty string, a missing field — is silence.
-  ##
-  ## Taking the first RUNE rather than the first byte matters: a reply whose
-  ## symbol field is a multi-byte character must not be sliced mid-codepoint on
-  ## its way to the replay.
-  if text.len == 0:
+  ## Strict radio symbol parser: "-" for silence (0), or a single uppercase or
+  ## lowercase letter in A..H (1..8). Anything else raises DirectiveError.
+  let trimmed = text.strip()
+  if trimmed == SymbolSilence:
     return 0
-  var first = ""
-  for rune in text.strip().runes:
-    first = toUpper(rune).toUTF8()
-    break
-  if first.len != 1:
-    return 0
-  for i in 0 ..< SymbolAlphabet.len:
-    if SymbolAlphabet[i] == first[0]:
-      return i + 1
-  0
+  if trimmed.len == 1:
+    let ch = toUpperAscii(trimmed[0])
+    for i in 0 ..< SymbolAlphabet.len:
+      if SymbolAlphabet[i] == ch:
+        return i + 1
+  raise newException(DirectiveError, "invalid symbol: " & text.truncateRunes(32))
 
 proc symbolIndexOfText*(text: string): int =
   ## The symbol index of one EXACT wire text ("A".."H"), 0 for anything else.
-  ## Distinct from `parseSymbol`, which is the tolerant model-reply path.
   if text.len != 1:
     return 0
   for i in 0 ..< SymbolAlphabet.len:
@@ -114,60 +103,32 @@ proc sanitizeNote*(text: string): string =
   text.replace("\n", " ").replace("\r", " ").strip().truncateRunes(MaxNoteRunes)
 
 proc parseIntent*(text: string): Intent =
-  ## Tolerant: case-insensitive, hyphens and spaces normalised to
-  ## underscores. Anything still unknown becomes `go` — the intent that always
-  ## has somewhere to be.
-  let key = text.strip().toLowerAscii().replace("-", "_").replace(" ", "_")
+  ## Strict intent parser: must match one of the six legal intents.
+  let key = text.strip().toLowerAscii()
   for intent in Intent:
     if $intent == key:
       return intent
-  intGo
+  raise newException(DirectiveError, "invalid intent: " & text.truncateRunes(32))
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## The outermost balanced `{...}` in a model reply, tolerating markdown
-  ## fences and any prose the model prefixed or suffixed. Falls back to
-  ## first-brace..last-brace when the scan finds no balanced pair, which is
-  ## what recovers a reply whose braces sit inside a quoted string.
-  var
-    depth = 0
-    start = -1
-    inString = false
-    escaped = false
-  for i, ch in text:
-    if inString:
-      if escaped: escaped = false
-      elif ch == '\\': escaped = true
-      elif ch == '"': inString = false
-      continue
-    case ch
-    of '"': inString = true
-    of '{':
-      if depth == 0: start = i
-      inc depth
-    of '}':
-      if depth > 0:
-        dec depth
-        if depth == 0 and start >= 0:
-          try:
-            return parseJson(text[start .. i])
-          except CatchableError:
-            start = -1
-    else: discard
-  let
-    first = text.find('{')
-    last = text.rfind('}')
-  if first < 0 or last <= first:
-    var head = text.strip()
+  ## Strict JSON object parser: the reply must be a single JSON object with no
+  ## surrounding prose or markdown fences.
+  let trimmed = text.strip()
+  if trimmed.len < 2 or trimmed[0] != '{' or trimmed[^1] != '}':
+    var head = trimmed
     if head.runeLen > 160:
       head = head.truncateRunes(160) & "..."
     raise newException(
-      DirectiveError, "no JSON object in reply: " & head.replace("\n", " "))
-  parseJson(text[first .. last])
+      DirectiveError, "reply must be a single JSON object: " & head.replace("\n", " "))
+  try:
+    result = parseJson(trimmed)
+  except CatchableError as e:
+    raise newException(DirectiveError, "invalid JSON in reply: " & e.msg)
+  if result.kind != JObject:
+    raise newException(DirectiveError, "reply JSON must be an object")
 
 proc readCoord(node: JsonNode): tuple[ok: bool, value: int] =
-  ## One target/face coordinate: an int, a float, or a numeric string.
-  ## Anything non-finite or unparseable reports `ok = false` so the caller
-  ## can apply its own default rather than inventing a position.
+  ## One target/face coordinate: an integer or finite number. No string coercion.
   if node.isNil:
     return (false, 0)
   case node.kind
@@ -177,30 +138,19 @@ proc readCoord(node: JsonNode): tuple[ok: bool, value: int] =
     let f = node.getFloat()
     if f != f or f > 1.0e9 or f < -1.0e9: (false, 0)
     else: (true, int(f))
-  of JString:
-    try: (true, int(parseFloat(node.getStr().strip())))
-    except CatchableError: (false, 0)
   else:
     (false, 0)
 
 proc readPoint(
-  node: JsonNode, defaultX, defaultY, maxX, maxY: int
-): tuple[given: bool, x, y: int] =
-  ## A `[x, y]` pair (an object with x/y keys is accepted too), clamped into
-  ## the map box. A missing or non-finite pair reports `given = false` and
-  ## returns the caller's default.
-  result = (false, defaultX, defaultY)
-  if node.isNil or node.kind == JNull:
+  node: JsonNode, maxX, maxY: int
+): tuple[ok: bool, x, y: int] =
+  ## Strict `[x, y]` pair, clamped into the map box.
+  result = (false, 0, 0)
+  if node.isNil or node.kind != JArray or node.len != 2:
     return
-  var
-    rx = (ok: false, value: 0)
-    ry = (ok: false, value: 0)
-  if node.kind == JArray and node.len >= 2:
+  let
     rx = readCoord(node[0])
     ry = readCoord(node[1])
-  elif node.kind == JObject:
-    rx = readCoord(node{"x"})
-    ry = readCoord(node{"y"})
   if not rx.ok or not ry.ok:
     return
   result = (
@@ -209,97 +159,96 @@ proc readPoint(
     clamp(ry.value, 0, max(0, maxY))
   )
 
-proc cogEntries(payload: JsonNode): seq[tuple[id: string, node: JsonNode]] =
-  ## The reply's `cogs` collection, accepted either as an ARRAY of objects or
-  ## as an OBJECT keyed by cog id (both shapes are things models actually
-  ## emit). Entries that are not objects are dropped.
-  let node = payload{"cogs"}
-  if node.isNil:
-    return @[]
-  if node.kind == JArray:
-    for item in node:
-      if item.kind == JObject:
-        result.add((item{"id"}.getStr(), item))
-  elif node.kind == JObject:
-    for key, item in node:
-      if item.kind == JObject:
-        let id = if item{"id"}.getStr().len > 0: item{"id"}.getStr() else: key
-        result.add((id, item))
-
 proc parseSquadDirective*(
   payload: JsonNode,
   commandedIds: seq[string],
   commandedCogs: seq[int],
   defaultX, defaultY, maxX, maxY: int
 ): SquadDirective =
-  ## Turns one parsed reply into a legal directive, REPAIRING every field the
-  ## schema bounds rather than rejecting the reply:
-  ##
-  ## * `note`      truncated to MaxNoteRunes on a rune boundary;
-  ## * `cogs`      extra entries dropped, a missing cog left for the caller to
-  ##               fill from last turn (or from `holdline`);
-  ## * `cogs[].id` matched case-insensitively and suffix-wise; an unmatched
-  ##               entry is assigned to the next unclaimed commanded cog BY
-  ##               POSITION, which is what rescues a model that invented its
-  ##               own naming;
-  ## * `intent`    unknown -> go;
-  ## * `target`    missing / non-finite -> the caller's default (the field
-  ##               centre); otherwise clamped to the field box;
-  ## * `face`      same clamp, absent -> none;
-  ## * `symbol`    first rune, upper-cased; anything outside A..H -> "-".
-  ##
-  ## Raises DirectiveError only when NO usable cog entry can be recovered —
-  ## that is the one condition the retry and then the scripted fallback exist
-  ## for.
+  ## Strictly validates one parsed reply into a legal directive. Rejects
+  ## missing/invalid fields, unknown intents, invalid symbols, wrong cog counts,
+  ## or mismatched cog ids with DirectiveError rather than fabricating a move.
   doAssert commandedIds.len == commandedCogs.len
-  result.note = sanitizeNote(payload{"note"}.getStr())
+  discard defaultX
+  discard defaultY
+  if payload.isNil or payload.kind != JObject:
+    raise newException(DirectiveError, "directive payload must be a JSON object")
+  let noteNode = payload{"note"}
+  if not noteNode.isNil and noteNode.kind notin {JString, JNull}:
+    raise newException(DirectiveError, "note must be a string or null")
+  result.note = if not noteNode.isNil and noteNode.kind == JString:
+    sanitizeNote(noteNode.getStr())
+  else:
+    ""
   result.source = dsLlm
+
+  let cogsNode = payload{"cogs"}
+  if cogsNode.isNil or cogsNode.kind != JArray:
+    raise newException(DirectiveError, "cogs must be a JSON array")
+  if cogsNode.len != commandedIds.len:
+    raise newException(
+      DirectiveError,
+      "cogs must contain exactly " & $commandedIds.len & " entry")
+
   var
     claimed = newSeq[bool](commandedIds.len)
-    byPosition = 0
-    matched = 0
     orders = newSeq[CogOrder](commandedIds.len)
-  for i in 0 ..< commandedIds.len:
-    orders[i] = CogOrder(
-      cogIndex: commandedCogs[i],
-      id: commandedIds[i],
-      intent: intGo,
-      targetX: defaultX,
-      targetY: defaultY,
-      symbol: 0
-    )
-  for entry in cogEntries(payload):
+  for item in cogsNode:
+    if item.kind != JObject:
+      raise newException(DirectiveError, "each cogs entry must be a JSON object")
+    let idNode = item{"id"}
+    if idNode.isNil or idNode.kind != JString or idNode.getStr().strip().len == 0:
+      raise newException(DirectiveError, "cogs entry missing string id")
+    let wanted = idNode.getStr().strip().toLowerAscii()
     var slot = -1
-    let wanted = entry.id.strip().toLowerAscii()
-    if wanted.len > 0:
-      for i, id in commandedIds:
-        if claimed[i]:
-          continue
-        let mine = id.toLowerAscii()
-        if mine == wanted or mine.endsWith(wanted) or wanted.endsWith(mine):
-          slot = i
-          break
+    for i, id in commandedIds:
+      if not claimed[i] and id.toLowerAscii() == wanted:
+        slot = i
+        break
     if slot < 0:
-      while byPosition < claimed.len and claimed[byPosition]:
-        inc byPosition
-      if byPosition >= claimed.len:
-        continue                     ## extra entries are dropped, never fatal
-      slot = byPosition
+      raise newException(
+        DirectiveError, "cogs entry id does not match commanded cog: " & idNode.getStr())
     claimed[slot] = true
-    inc matched
-    orders[slot].fromReply = true
-    let node = entry.node
-    orders[slot].intent = parseIntent(node{"intent"}.getStr())
-    let target = readPoint(node{"target"}, defaultX, defaultY, maxX, maxY)
-    orders[slot].targetX = target.x
-    orders[slot].targetY = target.y
-    let face = readPoint(node{"face"}, 0, 0, maxX, maxY)
-    orders[slot].hasFace = face.given
-    orders[slot].faceX = face.x
-    orders[slot].faceY = face.y
-    orders[slot].symbol = parseSymbol(node{"symbol"}.getStr())
-  if matched == 0:
-    raise newException(DirectiveError, "reply named no commanded cog")
+
+    let intentNode = item{"intent"}
+    if intentNode.isNil or intentNode.kind != JString:
+      raise newException(DirectiveError, "cogs entry missing string intent")
+    let intent = parseIntent(intentNode.getStr())
+
+    let target = readPoint(item{"target"}, maxX, maxY)
+    if not target.ok:
+      raise newException(DirectiveError, "cogs entry missing valid [x, y] target")
+
+    let faceNode = item{"face"}
+    var
+      hasFace = false
+      faceX = 0
+      faceY = 0
+    if not faceNode.isNil and faceNode.kind != JNull:
+      let face = readPoint(faceNode, maxX, maxY)
+      if not face.ok:
+        raise newException(DirectiveError, "cogs entry face must be null or [x, y]")
+      hasFace = true
+      faceX = face.x
+      faceY = face.y
+
+    let symbolNode = item{"symbol"}
+    if symbolNode.isNil or symbolNode.kind != JString:
+      raise newException(DirectiveError, "cogs entry missing string symbol")
+    let symbol = parseSymbol(symbolNode.getStr())
+
+    orders[slot] = CogOrder(
+      cogIndex: commandedCogs[slot],
+      id: commandedIds[slot],
+      intent: intent,
+      targetX: target.x,
+      targetY: target.y,
+      hasFace: hasFace,
+      faceX: faceX,
+      faceY: faceY,
+      symbol: symbol,
+      fromReply: true
+    )
   result.orders = orders
 
 proc directiveRecord*(

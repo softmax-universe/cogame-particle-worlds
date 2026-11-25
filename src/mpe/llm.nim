@@ -144,9 +144,12 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       "every turn is falling back to the scripted layer"
 
 proc requestFor*(
-  client: LlmClient, system, user: string, slot: int
+  client: LlmClient, system, user: string, slot: int, modelOverride = ""
 ): tuple[url: string, headers: HttpHeaders, body: string] =
   ## One Messages-API request, shaped for whichever transport is live.
+  let activeModel =
+    if modelOverride.len > 0: modelOverride
+    else: client.model
   var body = %*{
     "max_tokens": client.maxOutputTokens,
     "system": system,
@@ -162,14 +165,14 @@ proc requestFor*(
       headers["authorization"] = "Bearer " & client.bedrockToken
     result.url = client.bedrockUrl()
   elif client.transport == ltSidecar:
-    body["model"] = %client.model
+    body["model"] = %activeModel
     headers["anthropic-version"] = AnthropicVersion
     result.url = client.sidecarEndpoint & "/v1/messages"
   else:
-    body["model"] = %client.model
+    body["model"] = %activeModel
     ## Only the Claude 5 / Opus tiers accept an effort setting; Haiku 4.5
     ## rejects the whole request with a 400 if it is present.
-    if "haiku" notin client.model and "4-5" notin client.model:
+    if "haiku" notin activeModel and "4-5" notin activeModel:
       body["output_config"] = %*{"effort": "low"}
     headers["x-api-key"] = client.apiKey
     headers["anthropic-version"] = AnthropicVersion
@@ -475,6 +478,7 @@ proc userMessage*(operatorPrompt: string, viewJson: string): string =
   ## view. The view is built server-side from the seat's fog (see decide.nim).
   operatorBlock(operatorPrompt) & viewJson
 
-proc requestedModel*(client: LlmClient): string =
+proc requestedModel*(client: LlmClient, modelOverride = ""): string =
   if client.transport == ltBedrock: client.bedrockModels[client.bedrockModel]
+  elif modelOverride.len > 0: modelOverride
   else: client.model

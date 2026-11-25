@@ -15,4 +15,6 @@ block:
     doAssert body["model"].getStr() == "anthropic/claude-sonnet-4.6"
     doAssert not body.hasKey("anthropic_version")
     doAssert not body.hasKey("output_config")
+  let overridden = client.requestFor("rules", "private view", 0, "qwen/qwen3-32b")
+  doAssert parseJson(overridden.body)["model"].getStr() == "qwen/qwen3-32b"
   echo "hosted sidecar routing and seat attribution passed"
